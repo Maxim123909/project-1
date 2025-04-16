@@ -1,0 +1,311 @@
+import telebot
+from telebot import types
+import sqlite3
+from datetime import datetime, time
+import time as t
+import threading
+
+token = ''
+bot = telebot.TeleBot(token)
+
+conn = sqlite3.connect('medicine.db', check_same_thread=False)
+cursor = conn.cursor()
+
+
+# Инициализация базы данных
+def init_db():
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS medicines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        dosage TEXT,
+        time TEXT,
+        taken INTEGER DEFAULT 0,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS incompatible_meds (
+        med1 TEXT,
+        med2 TEXT,
+        warning TEXT
+    )
+    ''')
+
+    try:
+        cursor.executemany('''
+        INSERT OR IGNORE INTO incompatible_meds (med1, med2, warning) VALUES (?, ?, ?)
+        ''', [
+            ('Ибупрофен', 'Аспирин', 'Может усиливать риск кровотечений'),
+            ('Парацетамол', 'Алкоголь', 'Токсично для печени'),
+            ('Амоксициллин', 'Метронидазол', 'Усиливает побочные эффекты')
+        ])
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+
+
+init_db()
+
+
+def show_main_menu(chat_id, first_name):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('💊 Добавить лекарство', '📜 История приёма')
+    markup.add('⚠️ Проверить совместимость', '❌ Удалить лекарство')
+    markup.add('✅ Принять лекарство', '📊 Статистика')
+
+    bot.send_message(
+        chat_id,
+        f'Привет, {first_name}! Я бот-напоминатель о лекарствах.\n\nВыбери действие:',
+        reply_markup=markup
+    )
+
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+@bot.message_handler(func=lambda message: message.text == '💊 Добавить лекарство')
+def add_medicine(message):
+    msg = bot.send_message(message.chat.id, 'Введи название лекарства:', reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_name_step)
+
+
+def process_name_step(message):
+    name = message.text
+    msg = bot.send_message(message.chat.id, 'Введи дозировку (например, 1 таблетка или 50 мг):')
+    bot.register_next_step_handler(msg, process_dosage_step, name)
+
+
+def process_dosage_step(message, name):
+    dosage = message.text
+    msg = bot.send_message(message.chat.id, 'Введи время приёма (например, 08:00 или 14:30):')
+    bot.register_next_step_handler(msg, process_time_step, name, dosage)
+
+
+def process_time_step(message, name, dosage):
+    try:
+        time_str = message.text
+        datetime.strptime(time_str, '%H:%M')
+
+        user_id = message.from_user.id
+        cursor.execute(
+            'INSERT INTO medicines (user_id, name, dosage, time) VALUES (?, ?, ?, ?)',
+            (user_id, name, dosage, time_str)
+        )
+        conn.commit()
+
+        threading.Thread(target=schedule_reminder, args=(user_id, name, dosage, time_str)).start()
+        bot.send_message(message.chat.id, f'✅ Лекарство "{name}" добавлено на {time_str}!')
+        show_main_menu(message.chat.id, message.from_user.first_name)
+    except ValueError:
+        bot.send_message(message.chat.id, '❌ Неверный формат времени! Введи в формате ЧЧ:ММ.')
+        show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+@bot.message_handler(func=lambda message: message.text == '📜 История приёма')
+def show_history(message):
+    user_id = message.from_user.id
+    cursor.execute(
+        'SELECT name, dosage, time, taken, timestamp FROM medicines WHERE user_id = ? ORDER BY timestamp DESC',
+        (user_id,)
+    )
+    medicines = cursor.fetchall()
+
+    if not medicines:
+        bot.send_message(message.chat.id, 'История приёма пуста.')
+        return
+
+    history_text = '💊 История приёма лекарств:\n\n'
+    for med in medicines:
+        status = '✅ Принято' if med[3] else '❌ Не принято'
+        date_time = datetime.strptime(med[4], '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y %H:%M')
+        history_text += f'{med[0]} ({med[1]}) в {med[2]} - {status} ({date_time})\n'
+
+    bot.send_message(message.chat.id, history_text)
+
+
+@bot.message_handler(func=lambda message: message.text == '⚠️ Проверить совместимость')
+def check_compatibility(message):
+    msg = bot.send_message(message.chat.id, 'Введи два лекарства через запятую (например, "Ибупрофен, Аспирин"):',
+                           reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_compatibility_check)
+
+
+def process_compatibility_check(message):
+    meds = [m.strip() for m in message.text.split(',')]
+    if len(meds) != 2:
+        bot.send_message(message.chat.id, '❌ Введи ровно два лекарства!')
+        show_main_menu(message.chat.id, message.from_user.first_name)
+        return
+
+    cursor.execute(
+        'SELECT warning FROM incompatible_meds WHERE (med1 = ? AND med2 = ?) OR (med1 = ? AND med2 = ?)',
+        (meds[0], meds[1], meds[1], meds[0])
+    )
+    warning = cursor.fetchone()
+
+    if warning:
+        bot.send_message(message.chat.id, f'⚠️ Внимание: {warning[0]}')
+    else:
+        bot.send_message(message.chat.id, '✅ Эти лекарства можно принимать вместе (но проконсультируйся с врачом).')
+
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+@bot.message_handler(func=lambda message: message.text == '❌ Удалить лекарство')
+def delete_medicine(message):
+    user_id = message.from_user.id
+    cursor.execute(
+        'SELECT id, name, dosage, time FROM medicines WHERE user_id = ? AND taken = 0',
+        (user_id,)
+    )
+    medicines = cursor.fetchall()
+
+    if not medicines:
+        bot.send_message(message.chat.id, 'Нет активных лекарств для удаления.')
+        return
+
+    medicines_text = 'Выбери лекарство для удаления (напиши номер):\n\n'
+    medicines_list = []
+    for i, med in enumerate(medicines, 1):
+        medicines_text += f'{i}. {med[1]} ({med[2]}) в {med[3]}\n'
+        medicines_list.append(med[0])
+
+    msg = bot.send_message(message.chat.id, medicines_text, reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_delete_medicine, medicines_list)
+
+
+def process_delete_medicine(message, medicines_list):
+    try:
+        choice = int(message.text)
+        if 1 <= choice <= len(medicines_list):
+            medicine_id = medicines_list[choice - 1]
+            cursor.execute('DELETE FROM medicines WHERE id = ?', (medicine_id,))
+            conn.commit()
+            bot.send_message(message.chat.id, '✅ Лекарство удалено!')
+        else:
+            bot.send_message(message.chat.id, '❌ Неверный номер!')
+    except ValueError:
+        bot.send_message(message.chat.id, '❌ Введи число!')
+
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+@bot.message_handler(func=lambda message: message.text == '✅ Принять лекарство')
+def take_medicine(message):
+    user_id = message.from_user.id
+    cursor.execute(
+        'SELECT id, name, dosage, time FROM medicines WHERE user_id = ? AND taken = 0',
+        (user_id,)
+    )
+    medicines = cursor.fetchall()
+
+    if not medicines:
+        bot.send_message(message.chat.id, 'Нет лекарств для приёма.')
+        return
+
+    medicines_text = 'Выбери лекарство, которое ты принял (напиши номер):\n\n'
+    medicines_list = []
+    for i, med in enumerate(medicines, 1):
+        medicines_text += f'{i}. {med[1]} ({med[2]}) в {med[3]}\n'
+        medicines_list.append(med[0])
+
+    msg = bot.send_message(message.chat.id, medicines_text, reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_take_medicine, medicines_list)
+
+
+def process_take_medicine(message, medicines_list):
+    try:
+        choice = int(message.text)
+        if 1 <= choice <= len(medicines_list):
+            medicine_id = medicines_list[choice - 1]
+            cursor.execute(
+                'UPDATE medicines SET taken = 1, timestamp = CURRENT_TIMESTAMP WHERE id = ?',
+                (medicine_id,)
+            )
+            conn.commit()
+            bot.send_message(message.chat.id, '✅ Лекарство отмечено как принятое!')
+        else:
+            bot.send_message(message.chat.id, '❌ Неверный номер!')
+    except ValueError:
+        bot.send_message(message.chat.id, '❌ Введи число!')
+
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+@bot.message_handler(func=lambda message: message.text == '📊 Статистика')
+def show_statistics(message):
+    user_id = message.from_user.id
+
+    cursor.execute('SELECT COUNT(*) FROM medicines WHERE user_id = ?', (user_id,))
+    total = cursor.fetchone()[0]
+
+    cursor.execute('SELECT COUNT(*) FROM medicines WHERE user_id = ? AND taken = 1', (user_id,))
+    taken = cursor.fetchone()[0]
+
+    cursor.execute('SELECT COUNT(*) FROM medicines WHERE user_id = ? AND taken = 0', (user_id,))
+    not_taken = cursor.fetchone()[0]
+
+    if total == 0:
+        bot.send_message(message.chat.id, 'Нет данных для статистики.')
+        return
+
+    percentage_taken = (taken / total) * 100
+
+    cursor.execute('''
+    SELECT DATE(timestamp) as day, 
+           SUM(CASE WHEN taken = 1 THEN 1 ELSE 0 END) as taken_count,
+           SUM(CASE WHEN taken = 0 THEN 1 ELSE 0 END) as not_taken_count
+    FROM medicines 
+    WHERE user_id = ? AND timestamp >= DATE('now', '-7 days')
+    GROUP BY day
+    ORDER BY day DESC
+    ''', (user_id,))
+    weekly_stats = cursor.fetchall()
+
+    stats_text = '📊 Статистика приёма лекарств:\n\n'
+    stats_text += f'Всего лекарств: {total}\n'
+    stats_text += f'✅ Принято: {taken} ({percentage_taken:.1f}%)\n'
+    stats_text += f'❌ Не принято: {not_taken}\n\n'
+    stats_text += '📅 Последние 7 дней:\n'
+
+    for day in weekly_stats:
+        day_date = datetime.strptime(day[0], '%Y-%m-%d').strftime('%d.%m.%Y')
+        stats_text += f'\n{day_date}:\n'
+        stats_text += f'  ✅ Принято: {day[1]}\n'
+        stats_text += f'  ❌ Не принято: {day[2]}\n'
+
+    bot.send_message(message.chat.id, stats_text)
+
+
+def schedule_reminder(user_id, name, dosage, time_str):
+    try:
+        while True:
+            now = datetime.now().strftime('%H:%M')
+            if now == time_str:
+                bot.send_message(user_id, f'⏰ Напоминание: прими {name} ({dosage})!')
+                t.sleep(60)
+            t.sleep(30)
+    except Exception as e:
+        print("Ошибка в напоминании:", e)
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_unknown(message):
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+if __name__ == '__main__':
+    print('Бот запущен...')
+    bot.infinity_polling()
