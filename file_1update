@@ -1,0 +1,221 @@
+import telebot
+import sqlite3
+from datetime import datetime, timedelta
+import threading
+from telebot import types
+
+bot = telebot.TeleBot('')
+conn = sqlite3.connect('medicine.db', check_same_thread=False)
+c = conn.cursor()
+
+
+# Инициализация базы данных
+def init_db():
+    c.execute('''CREATE TABLE IF NOT EXISTS medicines
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, 
+                name TEXT, 
+                dosage TEXT, 
+                time TEXT, 
+                taken INTEGER DEFAULT 0,
+                taken_time TEXT,
+                last_reminded TEXT)''')
+    conn.commit()
+
+
+init_db()
+
+
+# Главное меню
+@bot.message_handler(commands=['start'])
+def start(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton('/add'), types.KeyboardButton('/list'))
+    bot.send_message(message.chat.id,
+                     "💊 Бот-напоминатель о лекарствах\n\n"
+                     "Доступные команды:\n"
+                     "/add - добавить лекарство\n"
+                     "/list - список ваших лекарств",
+                     reply_markup=markup)
+
+
+# Добавление лекарства
+@bot.message_handler(commands=['add'])
+def add_medicine(message):
+    msg = bot.send_message(message.chat.id, "Введите название лекарства:",
+                           reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, lambda m: process_medicine(m, 'name'))
+
+
+# Список лекарств
+@bot.message_handler(commands=['list'])
+def list_medicines(message):
+    c.execute("SELECT name, dosage, time FROM medicines WHERE user_id = ? AND taken = 0",
+              (message.from_user.id,))
+    medicines = c.fetchall()
+
+    if not medicines:
+        bot.send_message(message.chat.id, "У вас нет активных лекарств.")
+        return
+
+    text = "💊 Ваши активные лекарства:\n\n"
+    for idx, med in enumerate(medicines, 1):
+        text += f"{idx}. {med[0]} ({med[1]}) в {med[2]}\n"
+
+    bot.send_message(message.chat.id, text)
+
+
+# Процесс добавления лекарства
+def process_medicine(message, step, data=None):
+    if step == 'name':
+        if message.text.startswith('/'):
+            bot.send_message(message.chat.id, "Пожалуйста, введите название лекарства.")
+            return
+
+        data = {'name': message.text, 'user_id': message.from_user.id}
+        msg = bot.send_message(message.chat.id, "Введите дозировку:")
+        bot.register_next_step_handler(msg, lambda m: process_medicine(m, 'dosage', data))
+
+    elif step == 'dosage':
+        data['dosage'] = message.text
+        msg = bot.send_message(message.chat.id, "Введите время приема (ЧЧ:ММ):")
+        bot.register_next_step_handler(msg, lambda m: process_medicine(m, 'time', data))
+
+    elif step == 'time':
+        try:
+            datetime.strptime(message.text, '%H:%M')
+            c.execute('''INSERT INTO medicines 
+                        (user_id, name, dosage, time) 
+                        VALUES (?, ?, ?, ?)''',
+                      (data['user_id'], data['name'], data['dosage'], message.text))
+            conn.commit()
+
+            threading.Thread(target=remind,
+                             args=(data['user_id'], data['name'],
+                                   data['dosage'], message.text)).start()
+
+            bot.send_message(message.chat.id,
+                             f"✅ Лекарство {data['name']} успешно добавлено на {message.text}!")
+        except ValueError:
+            bot.send_message(message.chat.id,
+                             "❌ Неверный формат времени! Используйте ЧЧ:ММ (например, 08:00 или 14:30).")
+        finally:
+            start(message)
+
+
+# Напоминание
+def remind(user_id, name, dosage, time_str):
+    while True:
+        now = datetime.now().strftime('%H:%M')
+        if now == time_str:
+            send_reminder(user_id, name, dosage, "⏰ Напоминание")
+            break
+
+
+# Отправка напоминания с кнопками
+def send_reminder(user_id, name, dosage, prefix):
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("✅ Принял", callback_data=f"taken_{name}_{dosage}"),
+        types.InlineKeyboardButton("🔄 Через 5 мин", callback_data=f"later_{name}_{dosage}")
+    )
+
+    bot.send_message(user_id,
+                     f"{prefix}: прими {name} ({dosage})!",
+                     reply_markup=markup)
+
+
+# Отложенное напоминание
+def remind_later(user_id, name, dosage):
+    reminder_time = (datetime.now() + timedelta(minutes=5)).strftime('%H:%M:%S')
+    c.execute('''UPDATE medicines SET last_reminded = ? 
+                WHERE user_id = ? AND name = ? AND dosage = ? AND taken = 0''',
+              (reminder_time, user_id, name, dosage))
+    conn.commit()
+
+    threading.Timer(300, lambda: send_reminder(user_id, name, dosage, "⏰ Повторное напоминание")).start()
+
+
+# Обработчик callback-кнопок
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    try:
+        # Разделяем callback_data с проверкой количества частей
+        parts = call.data.split('_')
+        if len(parts) < 3:
+            raise ValueError("Неверный формат callback_data")
+
+        action, name, dosage = parts[:3]
+        user_id = call.from_user.id
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        if action == "taken":
+            # Обновляем статус лекарства
+            c.execute('''UPDATE medicines 
+                        SET taken = 1, taken_time = ?
+                        WHERE user_id = ? AND name = ? AND dosage = ? AND taken = 0''',
+                      (current_time, user_id, name, dosage))
+            conn.commit()
+
+            # Проверяем, было ли обновление
+            if c.rowcount == 0:
+                bot.answer_callback_query(call.id, "⚠️ Лекарство не найдено или уже принято")
+                return
+
+            # Формируем новое сообщение
+            new_text = f"✅ {call.message.text}\n(Принято в {current_time[11:16]})"
+
+            # Отвечаем пользователю
+            bot.answer_callback_query(call.id, f"✅ {name} отмечен как принятый!")
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=new_text,
+                reply_markup=None
+            )
+
+            # Логирование (можно заменить на отправку админу)
+            print(f"Пользователь {user_id} принял {name} в {current_time}")
+
+        elif action == "later":
+            # Запускаем отложенное напоминание
+            remind_later(user_id, name, dosage)
+
+            # Формируем новое сообщение
+            new_text = f"🔄 {call.message.text}\n(Напомню через 5 минут)"
+
+            # Отвечаем пользователю
+            bot.answer_callback_query(call.id, "Я напомню через 5 минут ⏰")
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=new_text,
+                reply_markup=None
+            )
+
+            # Логирование
+            print(f"Пользователь {user_id} отложил {name} в {current_time}")
+
+        else:
+            bot.answer_callback_query(call.id, "⚠️ Неизвестная команда")
+
+    except ValueError as ve:
+        print(f"Ошибка формата данных: {ve}")
+        bot.answer_callback_query(call.id, "⚠️ Ошибка данных, попробуйте снова")
+
+    except sqlite3.Error as e:
+        print(f"Ошибка базы данных: {e}")
+        bot.answer_callback_query(call.id, "⚠️ Ошибка базы данных", show_alert=True)
+
+    except Exception as e:
+        print(f"Неожиданная ошибка: {e}")
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ Произошла ошибка, попробуйте еще раз",
+            show_alert=True
+        )
+
+
+if __name__ == '__main__':
+    print("Бот запущен и готов к работе!")
+    bot.infinity_polling()
