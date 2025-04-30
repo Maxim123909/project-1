@@ -1,0 +1,270 @@
+import telebot
+import sqlite3
+from datetime import datetime, timedelta
+import threading
+import time as t
+
+bot = telebot.TeleBot('ВАШ_ТОКЕН')
+conn = sqlite3.connect('medicine.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# Храним состояние для каждого пользователя
+user_states = {}
+reminder_timers = {}
+
+def init_db():
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS medicines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        dosage TEXT,
+        time TEXT,
+        taken INTEGER DEFAULT 0,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+
+init_db()
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    help_text = """
+💊 Бот-напоминатель о лекарствах
+
+Доступные команды:
+/add - добавить лекарство
+/list - показать список лекарств
+/confirm - подтвердить прием
+/delete - удалить лекарство
+/history - история приема
+/stats - статистика
+/help - показать эту справку
+"""
+    bot.send_message(message.chat.id, help_text)
+
+@bot.message_handler(commands=['help'])
+def show_help(message):
+    start(message)
+
+@bot.message_handler(commands=['add'])
+def add_medicine(message):
+    msg = bot.send_message(message.chat.id, "Введите название лекарства:")
+    user_states[message.chat.id] = {'action': 'add_name'}
+    bot.register_next_step_handler(msg, process_medicine_step)
+
+def process_medicine_step(message):
+    chat_id = message.chat.id
+    if chat_id not in user_states:
+        return
+    
+    if user_states[chat_id]['action'] == 'add_name':
+        user_states[chat_id] = {
+            'action': 'add_dosage',
+            'name': message.text
+        }
+        bot.send_message(chat_id, "Введите дозировку (например: 1 таблетка, 50 мг):")
+        bot.register_next_step_handler(message, process_medicine_step)
+    
+    elif user_states[chat_id]['action'] == 'add_dosage':
+        user_states[chat_id] = {
+            'action': 'add_time',
+            'name': user_states[chat_id]['name'],
+            'dosage': message.text
+        }
+        bot.send_message(chat_id, "Введите время приема (в формате ЧЧ:ММ):")
+        bot.register_next_step_handler(message, process_medicine_step)
+    
+    elif user_states[chat_id]['action'] == 'add_time':
+        try:
+            time_str = message.text
+            datetime.strptime(time_str, '%H:%M')
+            
+            cursor.execute('''
+                INSERT INTO medicines (user_id, name, dosage, time)
+                VALUES (?, ?, ?, ?)''',
+                (chat_id, user_states[chat_id]['name'], 
+                 user_states[chat_id]['dosage'], time_str))
+            conn.commit()
+            
+            bot.send_message(chat_id, 
+                f"✅ Лекарство {user_states[chat_id]['name']} добавлено на {time_str}")
+            del user_states[chat_id]
+            
+        except ValueError:
+            bot.send_message(chat_id, "❌ Неверный формат времени! Используйте ЧЧ:ММ")
+            del user_states[chat_id]
+
+@bot.message_handler(commands=['list'])
+def list_medicines(message):
+    cursor.execute('''
+        SELECT name, dosage, time FROM medicines 
+        WHERE user_id = ? AND taken = 0
+        ORDER BY time''', (message.chat.id,))
+    medicines = cursor.fetchall()
+    
+    if not medicines:
+        bot.send_message(message.chat.id, "У вас нет активных лекарств.")
+        return
+    
+    text = "💊 Ваши лекарства:\n\n"
+    for med in medicines:
+        text += f"- {med[0]} ({med[1]}) в {med[2]}\n"
+    
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['confirm'])
+def confirm_medication(message):
+    chat_id = message.chat.id
+    
+    # Проверяем, есть ли активное напоминание
+    if chat_id in reminder_timers:
+        cursor.execute('''
+            SELECT name, dosage FROM medicines
+            WHERE user_id = ? AND taken = 0
+            ORDER BY timestamp DESC LIMIT 1''',
+            (chat_id,))
+        medicine = cursor.fetchone()
+        
+        if medicine:
+            name, dosage = medicine
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            cursor.execute('''
+                UPDATE medicines SET taken = 1, timestamp = ?
+                WHERE user_id = ? AND name = ? AND dosage = ? AND taken = 0''',
+                (current_time, chat_id, name, dosage))
+            conn.commit()
+            
+            reminder_timers[chat_id].cancel()
+            del reminder_timers[chat_id]
+            
+            bot.send_message(chat_id, f"✅ Прием {name} подтвержден в {current_time[11:16]}")
+            return
+    
+    # Если нет активного напоминания, создаем новое
+    cursor.execute('''
+        SELECT name, dosage, time FROM medicines
+        WHERE user_id = ? AND taken = 0
+        ORDER BY timestamp DESC LIMIT 1''',
+        (chat_id,))
+    medicine = cursor.fetchone()
+    
+    if not medicine:
+        bot.send_message(chat_id, "Нет лекарств для подтверждения.")
+        return
+    
+    name, dosage, time_str = medicine
+    send_reminder(chat_id, name, dosage, time_str)
+    bot.send_message(chat_id, 
+        f"⏰ Подтвердите прием: {name} ({dosage})\nОтправьте /confirm еще раз для подтверждения")
+
+def send_reminder(chat_id, name, dosage, time_str):
+    # Отменяем предыдущий таймер
+    if chat_id in reminder_timers:
+        reminder_timers[chat_id].cancel()
+    
+    # Устанавливаем новый таймер на 5 минут
+    timer = threading.Timer(300.0, send_reminder, [chat_id, name, dosage, time_str])
+    timer.start()
+    reminder_timers[chat_id] = timer
+    
+    bot.send_message(chat_id,
+        f"🔔 Напоминание: подтвердите прием {name} ({dosage})!\n"
+        "Отправьте /confirm для подтверждения")
+
+@bot.message_handler(commands=['delete'])
+def delete_medicine(message):
+    cursor.execute('''
+        SELECT id, name, dosage, time FROM medicines
+        WHERE user_id = ? AND taken = 0''',
+        (message.chat.id,))
+    medicines = cursor.fetchall()
+    
+    if not medicines:
+        bot.send_message(message.chat.id, "Нет лекарств для удаления.")
+        return
+    
+    text = "Введите номер лекарства для удаления:\n\n"
+    for i, med in enumerate(medicines, 1):
+        text += f"{i}. {med[1]} ({med[2]}) в {med[3]}\n"
+    
+    user_states[message.chat.id] = {
+        'action': 'delete',
+        'medicines': medicines
+    }
+    bot.send_message(message.chat.id, text)
+    bot.register_next_step_handler(message, process_delete)
+
+def process_delete(message):
+    chat_id = message.chat.id
+    if chat_id not in user_states or user_states[chat_id]['action'] != 'delete':
+        return
+    
+    try:
+        choice = int(message.text)
+        medicines = user_states[chat_id]['medicines']
+        
+        if 1 <= choice <= len(medicines):
+            med_id = medicines[choice-1][0]
+            cursor.execute("DELETE FROM medicines WHERE id = ?", (med_id,))
+            conn.commit()
+            bot.send_message(chat_id, "✅ Лекарство удалено!")
+        else:
+            bot.send_message(chat_id, "❌ Неверный номер!")
+    
+    except ValueError:
+        bot.send_message(chat_id, "❌ Введите номер лекарства!")
+    
+    del user_states[chat_id]
+
+@bot.message_handler(commands=['history'])
+def show_history(message):
+    cursor.execute('''
+        SELECT name, dosage, time, taken, timestamp
+        FROM medicines WHERE user_id = ?
+        ORDER BY timestamp DESC LIMIT 10''',
+        (message.chat.id,))
+    history = cursor.fetchall()
+    
+    if not history:
+        bot.send_message(message.chat.id, "История приема пуста.")
+        return
+    
+    text = "💊 История приема:\n\n"
+    for item in history:
+        status = "✅ Принято" if item[3] else "❌ Пропущено"
+        time = datetime.strptime(item[4], '%Y-%m-%d %H:%M:%S').strftime('%d.%m %H:%M')
+        text += f"{item[0]} ({item[1]}) - {status} в {time}\n"
+    
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    cursor.execute('''
+        SELECT COUNT(*) FROM medicines WHERE user_id = ?''',
+        (message.chat.id,))
+    total = cursor.fetchone()[0]
+    
+    cursor.execute('''
+        SELECT COUNT(*) FROM medicines
+        WHERE user_id = ? AND taken = 1''',
+        (message.chat.id,))
+    taken = cursor.fetchone()[0]
+    
+    if total == 0:
+        bot.send_message(message.chat.id, "Нет данных для статистики.")
+        return
+    
+    percent = (taken / total) * 100
+    text = f"""📊 Статистика приема:
+    
+Всего лекарств: {total}
+✅ Принято: {taken} ({percent:.1f}%)
+❌ Пропущено: {total - taken}"""
+    
+    bot.send_message(message.chat.id, text)
+
+if __name__ == '__main__':
+    print("Бот запущен...")
+    bot.infinity_polling()
