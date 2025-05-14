@@ -1,0 +1,17 @@
+from skimage import io, transform
+import matplotlib.pyplot as plt
+
+# Загрузка изображения
+image = io.imread('input.jpg')  # путь к вашему изображению
+
+# Уменьшение
+resized_image = transform.resize(image, (image.shape[0] // 2, image.shape[1] // 2), 
+                                anti_aliasing=True)
+
+# Сохранение результата
+io.imsave('output_resized.jpg', resized_image)
+
+# Показать результат
+plt.imshow(resized_image)
+plt.axis('off')
+plt.show()
